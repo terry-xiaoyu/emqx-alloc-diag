@@ -1,0 +1,323 @@
+#!/usr/bin/env escript
+%% -*- erlang -*-
+%% =====================================================================
+%% alloc_diag.escript - EMQX allocator memory diagnostic.
+%%
+%% Fetches allocator data from a running EMQX node over RPC and reports:
+%%   * how much multiblock-carrier memory is still held by each allocator
+%%     instance ("home") vs. ABANDONED into the carrier pool (free blocks
+%%     marked re-usable via madvise(MADV_FREE)),
+%%   * OS RSS vs. live bytes,
+%%   * suggested vm.args based on the detected OTP version.
+%%
+%% Run via EMQX's OWN erts (see alloc_diag.sh wrapper). The client must
+%% use -epmd_module ekka_epmd because EMQX registers its node with
+%% ekka_epmd (deterministic name->port), not the OS epmd.
+%%
+%% Usage:
+%%   alloc_diag.escript <node> <cookie> [--verbose]
+%% =====================================================================
+
+-record(state, {otp, has_acful, home, pool, pool_carriers, pool_used,
+                rss, live, total, cgroup}).
+
+main(Args) ->
+    {Target, Cookie, Verbose} = parse_args(Args),
+    {ok, _} = net_kernel:start([client_name(Target), longnames]),
+    erlang:set_cookie(node(), list_to_atom(Cookie)),
+    case net_adm:ping(Target) of
+        pong -> ok;
+        pang ->
+            io:format(standard_error,
+                      "~nERROR: cannot connect to ~p~n"
+                      "  check node name / cookie (hint: run 'emqx_ctl status' to"
+                      " see the real node name)~n", [Target]),
+            halt(1)
+    end,
+    OtpMajor = otp_major(Target),
+    Types = [binary_alloc, ets_alloc, eheap_alloc, std_alloc, sl_alloc,
+             ll_alloc, driver_alloc, fix_alloc, literal_alloc],
+    print_header(Target, OtpMajor),
+    io:format("  type           home       pool_carriers  pool       "
+              "pool_used  marked_reclaimable~n"),
+    io:format("  --------------------------------------------------"
+              "--------------------------------------~n"),
+    Rs = [diag(Target, T, Verbose) || T <- Types],
+    State = summarize(Target, Rs, OtpMajor),
+    print_recommendations(State),
+    halt(0).
+
+%% ---------------------------------------------------------------------
+%% CLI
+%% ---------------------------------------------------------------------
+parse_args([NodeStr, Cookie]) -> {list_to_atom(NodeStr), Cookie, false};
+parse_args([NodeStr, Cookie, "--verbose"]) -> {list_to_atom(NodeStr), Cookie, true};
+parse_args(_) ->
+    io:format(standard_error,
+              "usage: alloc_diag.escript <node> <cookie> [--verbose]~n", []),
+    halt(1).
+
+%% unique short-lived node name, same host as the target (longnames)
+client_name(Target) ->
+    [_Name, Host] = string:split(atom_to_list(Target), "@", all),
+    list_to_atom("remsh_allocdiag_" ++ os:getpid() ++ "@" ++ Host).
+
+print_header(Target, OtpMajor) ->
+    Emqx = case rpc:call(Target, application, get_key, [emqx, vsn], 10000) of
+               {ok, V} -> V;
+               _ -> "?"
+           end,
+    io:format("~nemqx ~s (OTP ~p) node ~p~n~n",
+              [Emqx, case OtpMajor of 0 -> "?"; M -> M end, Target]).
+
+%% ---------------------------------------------------------------------
+%% OTP version / feature detection on the target
+%% ---------------------------------------------------------------------
+otp_major(Node) ->
+    case rpc:call(Node, erlang, system_info, [otp_release], 10000) of
+        Rel when is_list(Rel) ->
+            case string:to_integer(Rel) of
+                {Major, _} when is_integer(Major) -> Major;
+                _ -> 0
+            end;
+        _ -> 0
+    end.
+
+has_acful(Node) ->
+    case rpc:call(Node, erlang, system_info, [{allocator, binary_alloc}], 10000) of
+        L when is_list(L) ->
+            lists:any(fun({instance, _, Props}) ->
+                              lists:keymember(acful, 1,
+                                              proplists:get_value(options, Props, []))
+                      end, L);
+        _ -> false
+    end.
+
+%% ---------------------------------------------------------------------
+%% Helpers (parse erlang:system_info({allocator, T}) terms)
+%% ---------------------------------------------------------------------
+%% used bytes in a blocks list: pool {size,S} / mbcs {size,Cur,_,_}
+blksz(Blks) ->
+    lists:sum([case lists:keyfind(size, 1, Info) of
+                   {size, S} when is_integer(S) -> S;
+                   {size, S, _, _} -> S;
+                   _ -> 0
+               end || {_, Info} <- Blks]).
+
+%% current carriers_size: mbcs/sbcs 4-tuple / pool 2-tuple
+csz(L) ->
+    case lists:keyfind(carriers_size, 1, L) of
+        {carriers_size, C, _, _} -> C;
+        {carriers_size, C} -> C;
+        _ -> 0
+    end.
+
+%% number of pooled carriers
+pcnt(L) ->
+    case lists:keyfind(carriers, 1, L) of
+        {carriers, N} -> N;
+        _ -> 0
+    end.
+
+mb(B) when is_integer(B) -> B / 1048576;
+mb(_) -> 0.0.
+
+%% ---------------------------------------------------------------------
+%% One allocator type
+%% ---------------------------------------------------------------------
+diag(Target, Type, Verbose) ->
+    case rpc:call(Target, erlang, system_info, [{allocator, Type}], 30000) of
+        {badrpc, Reason} ->
+            io:format("  ~-14s rpc error: ~p~n", [Type, Reason]),
+            {Type, 0, 0, 0, 0};
+        false ->
+            io:format("  ~-14s disabled~n", [Type]),
+            {Type, 0, 0, 0, 0};
+        All when is_list(All) ->
+            {Home, Pools} =
+                lists:foldl(fun({instance, Ix, Props}, {H, Ps}) ->
+                                    Mb = proplists:get_value(mbcs, Props, []),
+                                    Sb = proplists:get_value(sbcs, Props, []),
+                                    H0 = csz(Mb) + csz(Sb),
+                                    case proplists:get_value(mbcs_pool, Props) of
+                                        undefined ->
+                                            maybe_instance(Verbose, Ix, H0),
+                                            {H + H0, Ps};
+                                        Pl ->
+                                            N0 = pcnt(Pl),
+                                            S0 = csz(Pl),
+                                            U0 = blksz(proplists:get_value(blocks, Pl, [])),
+                                            maybe_instance(Verbose, Ix, H0, N0, S0, U0),
+                                            {H + H0, [{N0, S0, U0} | Ps]}
+                                    end
+                            end, {0, []}, All),
+            {N, S, U} = lists:foldl(fun({A, B, C}, {Nn, Ss, Uu}) ->
+                                            {Nn + A, Ss + B, Uu + C}
+                                    end, {0, 0, 0}, Pools),
+            io:format("  ~-14s home=~8.2fMB  pool_carriers=~5w  "
+                      "pool=~8.2fMB  pool_used=~8.2fMB  "
+                      "marked_reclaimable=~8.2fMB~n",
+                      [Type, mb(Home), N, mb(S), mb(U), mb(S - U)]),
+            {Type, Home, N, S, U}
+    end.
+
+maybe_instance(false, _Ix, _H0) -> ok;
+maybe_instance(true, Ix, H0) ->
+    io:format("      ~p: home=~8.2fMB  (pool disabled)~n", [Ix, mb(H0)]).
+
+maybe_instance(false, _Ix, _H0, _N0, _S0, _U0) -> ok;
+maybe_instance(true, Ix, H0, N0, S0, U0) ->
+    io:format("      ~p: home=~8.2fMB  pool_carriers=~5w  "
+              "pool=~8.2fMB  pool_used=~8.2fMB~n",
+              [Ix, mb(H0), N0, mb(S0), mb(U0)]).
+
+%% ---------------------------------------------------------------------
+%% OS RSS / cgroup on the target (robust across Linux/BusyBox/macOS)
+%% ---------------------------------------------------------------------
+target_pid(Node) ->
+    rpc:call(Node, os, getpid, [], 10000).
+
+target_rss(Node) ->
+    Pid = target_pid(Node),
+    case vmrss(rpc:call(Node, os, cmd, ["cat /proc/" ++ Pid ++ "/status"], 10000)) of
+        {ok, B} -> B;
+        error ->
+            case psrss(rpc:call(Node, os, cmd, ["ps -o rss= -p " ++ Pid], 10000)) of
+                {ok, B2} -> B2;
+                error -> undefined
+            end
+    end.
+
+vmrss(Out) when is_list(Out) ->
+    Toks = [string:tokens(L, " \t") || L <- string:tokens(Out, "\n")],
+    case [KB || ["VmRSS:", KB | _] <- Toks] of
+        [KB | _] -> {ok, list_to_integer(KB) * 1024};
+        [] -> error
+    end;
+vmrss(_) -> error.
+
+psrss(Out) when is_list(Out) ->
+    case catch list_to_integer(string:trim(Out)) of
+        KB when is_integer(KB), KB >= 0 -> {ok, KB * 1024};
+        _ -> error
+    end;
+psrss(_) -> error.
+
+cgroup_limit(Node) ->
+    Out = rpc:call(Node, os, cmd,
+                   ["cat /sys/fs/cgroup/memory.max 2>/dev/null || "
+                    "cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null"],
+                   10000),
+    case string:trim(Out) of
+        "max" -> undefined;
+        "" -> undefined;
+        S -> case catch list_to_integer(S) of
+                 N when is_integer(N), N > 0 -> N;
+                 _ -> undefined
+             end
+    end.
+
+%% ---------------------------------------------------------------------
+%% Overall summary
+%% ---------------------------------------------------------------------
+summarize(Target, Rs, OtpMajor) ->
+    {H, N, S, U} =
+        lists:foldl(fun({_, H0, N0, S0, U0}, {H1, N1, S1, U1}) ->
+                            {H1 + H0, N1 + N0, S1 + S0, U1 + U0}
+                    end, {0, 0, 0, 0}, Rs),
+    Mem = rpc:call(Target, erlang, memory, [], 15000),
+    Live = proplists:get_value(binary, Mem, 0),
+    Total = proplists:get_value(total, Mem, 0),
+    Rss = target_rss(Target),
+    Cg = cgroup_limit(Target),
+    io:format("~n=== overall ===~n"),
+    io:format("  VM retained (home+pool):     ~8.2fMB~n", [mb(H + S)]),
+    io:format("    home (not marked):         ~8.2fMB~n", [mb(H)]),
+    io:format("    pool total (abandoned):    ~8.2fMB   (~w carriers)~n",
+              [mb(S), N]),
+    io:format("    pool used (still live):    ~8.2fMB~n", [mb(U)]),
+    io:format("    pool marked-reclaimable:   ~8.2fMB   (madvise(MADV_FREE))~n",
+              [mb(S - U)]),
+    io:format("  OS VmRSS:                    ~8.2fMB~n",
+              [case Rss of undefined -> 0.0; B -> mb(B) end]),
+    io:format("  erlang:memory(binary) live:  ~8.2fMB~n", [mb(Live)]),
+    io:format("  erlang:memory(total):        ~8.2fMB~n", [mb(Total)]),
+    case Cg of
+        undefined -> ok;
+        _ -> io:format("  cgroup memory limit:        ~8.2fMB~n", [mb(Cg)])
+    end,
+    #state{otp = OtpMajor, has_acful = has_acful(Target),
+           home = H, pool = S, pool_carriers = N, pool_used = U,
+           rss = Rss, live = Live, total = Total, cgroup = Cg}.
+
+%% ---------------------------------------------------------------------
+%% Recommendations
+%% ---------------------------------------------------------------------
+print_recommendations(#state{} = S) ->
+    io:format("~n=== recommendation (based on detected OTP ~p) ===~n",
+              [case S#state.otp of 0 -> "?"; M -> M end]),
+    [io:format("  ~ts~n", [unicode:characters_to_binary(L)]) || L <- recommend(S)],
+    io:format("~n").
+
+recommend(S) ->
+    Otp = S#state.otp,
+    PoolBig = S#state.pool > S#state.home,
+    RssHi = case {S#state.rss, S#state.live} of
+                {R, L} when is_integer(R), is_integer(L), L > 0 -> R > L * 2;
+                _ -> false
+            end,
+    [oheader(Otp)]
+    ++ feature_note(Otp, S#state.has_acful)
+    ++ case PoolBig andalso RssHi of
+           true -> [os_rss_mark(Otp)];
+           false -> [os_rss_low()]
+       end
+    ++ (case S#state.pool of
+            0 ->
+                ["NOTE: no carriers are abandoned into the pool, so free blocks"
+                 " are NOT marked re-usable. Check that carrier migration is on"
+                 " (acul > 0, not +M<i>t false / +M<i>as bf) and that per-carrier"
+                 " utilization actually drops below acul%."];
+            _ -> []
+        end)
+    ++ ["VM args: add +M<i>as aoffcbf explicitly to document intent (it is"
+        " already the effective default when carrier migration is on)."]
+    ++ ["VM args: tune +M<i>acul (default 60) - lower = less carrier churn but"
+        " more memory retained; higher = more aggressive abandon/marking."].
+
+oheader(0) ->
+    "(OTP release could not be detected on the target node.)";
+oheader(Otp) ->
+    "This node runs OTP " ++ integer_to_list(Otp)
+    ++ " (EMQX 4.4.x = OTP 24; 5.x/6.x may vary - always check, never assume).".
+
+%% HasAcful = 'acful' shows up in the allocator options -> OTP >= 26.
+feature_note(Otp, true) when Otp >= 27 ->
+    ["+M<i>acful de is available (default is 0 = free blocks of pooled"
+     " carriers are NOT marked re-usable). If RSS stays high while usage is low,"
+     " set +M<i>acful de to enable marking.",
+     "+Mumadtn true is available on OTP 27.3.4.x-later / 28 (OTP-19739): switches"
+     " madvise(MADV_FREE) to MADV_DONTNEED so discarded pages are returned to the"
+     " OS eagerly. On older OTP 27.x the option is absent."];
+feature_note(_Otp, true) ->
+    ["+M<i>acful de is available (default is 0 = no marking). +Mumadtn is NOT"
+     " available here - RSS from abandoned pages only drops under memory pressure."];
+feature_note(_Otp, false) ->
+    ["+M<i>acful and +Mumadtn are NOT available. The VM uses madvise(MADV_FREE):"
+     " abandoned free blocks are marked re-usable but only reclaimed by the kernel"
+     " under memory pressure - RSS will stay high until then. The only way to make"
+     " RSS drop eagerly is to upgrade to OTP 27.3.4.x-later/28 and use"
+     " +Mumadtn true."].
+
+os_rss_mark(Otp) ->
+    "OBSERVED: RSS >> live binary bytes and a large share of the pool is"
+    " marked-reclaimable - this is MADV_FREE laziness, not a leak. The kernel"
+    " will reclaim those pages under memory pressure."
+    ++ case Otp >= 27 of
+           true -> " If you need RSS to drop immediately, add: +Mumadtn true";
+           false -> " On this OTP you cannot force eager return; monitor or upgrade."
+       end.
+
+os_rss_low() ->
+    "OBSERVED: RSS is not far above live usage, or the pool is small - the"
+    " allocator is not retaining much reclaimable memory right now.".
