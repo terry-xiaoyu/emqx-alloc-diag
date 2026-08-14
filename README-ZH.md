@@ -40,8 +40,10 @@
 # 确认「正在发生」的尺寸不匹配（见第八节）：
 #   --trend 60     快速两采样检查
 #   --watch 60 10  RSS 波动场景：采样 10 次（间隔 60s），统计活跃区间数
+#   --pool-sizes   abandon 池里空闲块的尺寸直方图
 ./alloc_diag.sh --rel /path/to/emqx-release --trend 60
 ./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes
 ```
 
 **必须使用 EMQX 自己 release 中的 `erts` 来运行**（wrapper 已经帮你处理好了），原因请见[第六节](#六如何连接-emqx-节点原理)。
@@ -200,10 +202,13 @@ emqx 4.4.37 (OTP 24) node 'a1f17d962508@172.17.0.2'
 | 列 | 含义 |
 |---|---|
 | `home` | 该 allocator 各 instance 当前持有的 carrier 空间（地址空间，包含 used 和 free block）。**这部分 free block 不会被标记**，因此 RSS 会保持占用。 |
-| `pool_carriers` | 被 abandon 后进入 pool 的 carrier 数量。 |
+| `home_cr` | 各 instance 当前持有的 carrier 数量（尚未进 pool）。 |
+| `pool_cr` | 被 abandon 后进入 pool 的 carrier 数量。 |
 | `pool` | pool 中 carrier 的总空间。 |
 | `pool_used` | pool 中仍在使用的 block。**不会被标记**。 |
 | `marked_reclaimable` | `pool − pool_used`。**这是已经标记给内核、但内核尚未真正回收的那部分**。 |
+
+`=== overall ===` 块开头有一行 `total carriers: N (home=…, pool=…)`（所有 allocator 汇总）。之后还有一个 `=== allocator configuration ===` 块，打印每个 allocator 的 `as`（策略）、`acul`/`acnl`/`acfml` abandon 阈值、`sbct`、`smbcs`/`lmbcs` carrier 尺寸、`atags`、`cp`（carrier pool 是否开启）。`min_block_size` 不通过 `system_info` 暴露（它是策略内部常量）。
 
 **快速判读规则：**
 
@@ -328,6 +333,35 @@ pool 很大（abandon 的 carrier 很多）**不代表它一定在被复用**。
 
 根因通常是**分配尺寸分布发生了偏移**：一波小对象把 carrier abandon 成满是小空闲块的 pool，接着一波大对象塞不进这些小块，于是每一波都重新 `mmap` 新 carrier。先拿到上面的数据，再决定怎么调（`acul`/`acfml`，或确认这个尺寸偏移是否属于预期的负载变化）。
 
+### 8.1 被 abandon 的都是什么尺寸（`--pool-sizes`）
+
+想看 pool 里空闲块的**尺寸分布**（以及它们是不是都一样大）：
+
+```bash
+# 默认 hist_start=512 B —— 小对象（<512 B）都会落进同一个桶
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes
+
+# 细粒度 hist_start=32 B —— 用来区分 ~76B/104B 与 256B 的块
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32
+```
+
+它在节点上调用 `instrument:carriers/1`，把每个 pooled carrier 的空闲块尺寸直方图按 allocator 聚合：
+
+```
+=== abandoned-pool free-block size distribution (hist_start=512 B) ===
+  (log2-bucketed, hist_start=512 B; each slot doubles in size)
+
+  binary_alloc   6 free blocks in pool:
+         64 KB  5 blocks
+          4 MB  1 block
+```
+
+怎么读：池里空闲块大多是 ~64 KB、少量 ~4 MB —— 即**不是单一尺寸**。如果只有一个槽占绝对多数（比如全是 ~8 KB），说明 churn 的是某类固定大小的对象；如果铺满多个槽，则是多种尺寸混在一起。
+
+更小的 `hist_start` 能给出更细的分桶：76 字节的 message payload 会变成一个 ~104 字节的块（payload + header + atag），默认 512 B 直方图会把它们全塞进 "<512 B" 这一档，而 `--pool-sizes 32` 能把它们解析到 "~128 B" 档。用它来确认某类固定尺寸的小消息 churn 正在填满池子。
+
+> 需要 release 里有 `tools` 应用（`instrument` 模块）。如果节点报 `instrument:carriers/1 unavailable`，就在 remsh 里手动跑 `erts_internal:gather_carrier_info/1` 那段脚本。
+
 ---
 
 ## 文件清单
@@ -335,5 +369,5 @@ pool 很大（abandon 的 carrier 很多）**不代表它一定在被复用**。
 | 文件 | 作用 |
 |---|---|
 | `alloc_diag.sh` | wrapper：定位 release/erts、探测节点名与 cookie，并设置 `ERL_FLAGS` |
-| `alloc_diag.escript` | 主体逻辑：RPC 抓取数据、解析、汇总、RSS/cgroup、OTP 探测、carrier-pool 复用 / 尺寸不匹配诊断（`--trend`）与建议 |
+| `alloc_diag.escript` | 主体逻辑：RPC 抓取数据、解析、汇总、allocator 配置打印、RSS/cgroup、OTP 探测、carrier-pool 复用 / 尺寸不匹配诊断（`--trend`/`--watch`）、abandon 池尺寸直方图（`--pool-sizes`）与建议 |
 | `README.md` | 本文档 |

@@ -42,8 +42,10 @@ It separately accounts for the memory that has been abandoned into the carrier p
 # Confirm an ONGOING size mismatch (see Section 8):
 #   --trend 60     quick two-sample check
 #   --watch 60 10  for fluctuating RSS: 10 samples, 60s apart, count active intervals
+#   --pool-sizes   size histogram of the free blocks in the abandoned pool
 ./alloc_diag.sh --rel /path/to/emqx-release --trend 60
 ./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes
 ```
 
 **You must run it with EMQX's own release `erts`** (the wrapper already handles this), as explained in [Section 6](#6-how-emqx-node-connection-works).
@@ -202,10 +204,17 @@ emqx 4.4.37 (OTP 24) node 'a1f17d962508@172.17.0.2'
 | Column | Meaning |
 |---|---|
 | `home` | The allocator's current carrier space held by each instance (address space, including used and free blocks). **These free blocks are not marked** and RSS remains reserved. |
-| `pool_carriers` | Number of carriers abandoned into the pool. |
+| `home_cr` | Number of carriers currently held by the instances (not yet pooled). |
+| `pool_cr` | Number of carriers abandoned into the pool. |
 | `pool` | Total carrier space inside the pool. |
 | `pool_used` | Blocks still in use in the pool. **Not marked**. |
 | `marked_reclaimable` | `pool - pool_used`. **This is the portion already marked for the kernel, but not yet reclaimed by it**. |
+
+The `=== overall ===` block opens with a `total carriers: N (home=…, pool=…)`
+line (summed over all allocators). A `=== allocator configuration ===` block then
+prints each allocator's `as` (strategy), `acul`/`acnl`/`acfml` abandon thresholds,
+`sbct`, `smbcs`/`lmbcs` carrier sizes, `atags`, and `cp` (carrier pool enabled).
+`min_block_size` is not exposed by `system_info` (it is strategy-internal).
 
 **Quick interpretation rules**:
 
@@ -351,6 +360,45 @@ of larger objects cannot fit them, so each burst `mmap`s new carriers. Collect
 the numbers above first, then decide the fix (tune `acul`/`acfml`, or accept the
 size shift as an expected workload change).
 
+### 8.1 What sizes are being abandoned (`--pool-sizes`)
+
+To see the **size distribution** of the free blocks sitting in the pool (and
+whether they are all the same size or not):
+
+```bash
+# default: hist_start=512 B — small blocks (<512 B) all fall in one bucket
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes
+
+# fine granularity: hist_start=32 B — to distinguish ~76B/104B from 256B blocks
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32
+```
+
+This calls `instrument:carriers/1` on the node and aggregates the free-block
+size histogram of every pooled carrier, per allocator:
+
+```
+=== abandoned-pool free-block size distribution (hist_start=512 B) ===
+  (log2-bucketed, hist_start=512 B; each slot doubles in size)
+
+  binary_alloc   6 free blocks in pool:
+         64 KB  5 blocks
+          4 MB  1 block
+```
+
+Reading: the pool's free blocks are mostly ~64 KB plus a few ~4 MB — i.e. **not
+one uniform size**. If a single slot dominates (e.g. all ~8 KB), the churn is one
+fixed-size object; if it spreads across many slots, many sizes mix together.
+
+A smaller `hist_start` gives finer buckets for small blocks: a 76-byte message
+payload becomes a ~104-byte block (payload + header + atag), which the default
+512 B histogram lumps into the "<512 B" slot, but `--pool-sizes 32` resolves into
+the ~128 B slot. Use this to confirm a fixed-size small-message churn is filling
+the pool.
+
+> Requires the `tools` OTP app (`instrument` module) in the release. If the node
+> reports `instrument:carriers/1 unavailable`, run the
+> `erts_internal:gather_carrier_info/1` snippet manually in a remsh shell.
+
 ---
 
 ## File list
@@ -358,5 +406,5 @@ size shift as an expected workload change).
 | File | Purpose |
 |---|---|
 | `alloc_diag.sh` | Wrapper: locate release/erts, detect node name and cookie, set `ERL_FLAGS` |
-| `alloc_diag.escript` | Main logic: RPC collection, parsing, aggregation, RSS/cgroup, OTP detection, carrier-pool reuse / size-mismatch diagnosis (`--trend`), and recommendations |
+| `alloc_diag.escript` | Main logic: RPC collection, parsing, aggregation, allocator configuration, RSS/cgroup, OTP detection, carrier-pool reuse / size-mismatch diagnosis (`--trend`/`--watch`), abandoned-pool size histogram (`--pool-sizes`), and recommendations |
 | `README.md` | This document |

@@ -54,6 +54,11 @@ Options:
                  apart; reports total deltas, how many intervals were active,
                  and the net RSS change. Use this when RSS fluctuates rather
                  than rising monotonically.
+  --pool-sizes [<hist_start>]   print the size distribution (log2 histogram)
+                 of free blocks in the abandoned carrier pool, so you can see
+                 what sizes are churning in and whether they are all the same.
+                 Optional <hist_start> (default 512 B) gives finer buckets for
+                 small blocks (e.g. 32 to resolve ~76B message blocks).
   -h, --help     show this help.
 
 Node name / cookie are auto-detected in this order:
@@ -78,6 +83,7 @@ NODE="${EMQX_NODE:-}"
 COOKIE="${EMQX_COOKIE:-}"
 VERBOSE=""
 TREND=""
+POOLSIZES=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --rel)    REL="$2"; shift 2 ;;
@@ -87,6 +93,14 @@ while [ $# -gt 0 ]; do
         --verbose) VERBOSE="--verbose"; shift ;;
         --trend) TREND="--trend $2"; shift 2 ;;
         --watch) TREND="--watch $2 $3"; shift 3 ;;
+        --pool-sizes)
+            POOLSIZES="--pool-sizes"
+            shift
+            # optional numeric histogram_start (finer buckets for small blocks)
+            if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+                POOLSIZES="$POOLSIZES $1"; shift
+            fi
+            ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown arg: $1 (try -h)" >&2; exit 1 ;;
     esac
@@ -155,4 +169,4 @@ echo "using node:    $NODE"
 export ERL_FLAGS="-start_epmd false -epmd_module ekka_epmd -boot_var RELEASE_LIB \"$REL/lib\""
 
 exec "$ERTS_DIR/bin/escript" "$SCRIPT_DIR/alloc_diag.escript" \
-    "$NODE" "$COOKIE" $VERBOSE $TREND
+    "$NODE" "$COOKIE" $VERBOSE $TREND $POOLSIZES

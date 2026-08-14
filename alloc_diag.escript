@@ -22,7 +22,7 @@
                 rss, live, total, cgroup}).
 
 main(Args) ->
-    {Target, Cookie, Verbose, TrendSec, Watch} = parse_args(Args),
+    {Target, Cookie, Verbose, TrendSec, Watch, PoolSizes} = parse_args(Args),
     {ok, _} = net_kernel:start([client_name(Target), longnames]),
     erlang:set_cookie(node(), list_to_atom(Cookie)),
     case net_adm:ping(Target) of
@@ -38,12 +38,13 @@ main(Args) ->
     Types = [binary_alloc, ets_alloc, eheap_alloc, std_alloc, sl_alloc,
              ll_alloc, driver_alloc, fix_alloc, literal_alloc],
     print_header(Target, OtpMajor),
-    io:format("  type           home       pool_carriers  pool       "
-              "pool_used  marked_reclaimable~n"),
+    io:format("  type           home         home_cr  pool_cr  pool        "
+              "pool_used   marked_reclaimable~n"),
     io:format("  --------------------------------------------------"
-              "--------------------------------------~n"),
+              "------------------------------------------------~n"),
     Rs = [diag(Target, T, Verbose) || T <- Types],
     State = summarize(Target, Rs, OtpMajor),
+    print_alloc_config(Target, Types),
     print_pool_reuse(Target, Types),
     case Watch of
         {Interval, Count} -> pool_watch(Target, Types, Interval, Count);
@@ -53,6 +54,10 @@ main(Args) ->
                 Sec -> pool_trend(Target, Types, Sec)
             end
     end,
+    case PoolSizes of
+        false -> ok;
+        HS -> pool_sizes(Target, Types, HS)
+    end,
     print_recommendations(State),
     halt(0).
 
@@ -60,23 +65,34 @@ main(Args) ->
 %% CLI
 %% ---------------------------------------------------------------------
 parse_args([NodeStr, Cookie]) ->
-    {list_to_atom(NodeStr), Cookie, false, undefined, undefined};
+    {list_to_atom(NodeStr), Cookie, false, undefined, undefined, false};
 parse_args([NodeStr, Cookie, "--verbose"]) ->
-    {list_to_atom(NodeStr), Cookie, true, undefined, undefined};
+    {list_to_atom(NodeStr), Cookie, true, undefined, undefined, false};
 parse_args([NodeStr, Cookie, "--trend", Sec]) ->
-    {list_to_atom(NodeStr), Cookie, false, list_to_integer(Sec), undefined};
+    {list_to_atom(NodeStr), Cookie, false, list_to_integer(Sec), undefined, false};
 parse_args([NodeStr, Cookie, "--verbose", "--trend", Sec]) ->
-    {list_to_atom(NodeStr), Cookie, true, list_to_integer(Sec), undefined};
+    {list_to_atom(NodeStr), Cookie, true, list_to_integer(Sec), undefined, false};
 parse_args([NodeStr, Cookie, "--watch", Interval, Count]) ->
     {list_to_atom(NodeStr), Cookie, false, undefined,
-     {list_to_integer(Interval), list_to_integer(Count)}};
+     {list_to_integer(Interval), list_to_integer(Count)}, false};
 parse_args([NodeStr, Cookie, "--verbose", "--watch", Interval, Count]) ->
     {list_to_atom(NodeStr), Cookie, true, undefined,
-     {list_to_integer(Interval), list_to_integer(Count)}};
+     {list_to_integer(Interval), list_to_integer(Count)}, false};
+parse_args([NodeStr, Cookie, "--pool-sizes"]) ->
+    {list_to_atom(NodeStr), Cookie, false, undefined, undefined, 512};
+parse_args([NodeStr, Cookie, "--pool-sizes", HistStart]) ->
+    {list_to_atom(NodeStr), Cookie, false, undefined, undefined,
+     list_to_integer(HistStart)};
+parse_args([NodeStr, Cookie, "--verbose", "--pool-sizes"]) ->
+    {list_to_atom(NodeStr), Cookie, true, undefined, undefined, 512};
+parse_args([NodeStr, Cookie, "--verbose", "--pool-sizes", HistStart]) ->
+    {list_to_atom(NodeStr), Cookie, true, undefined, undefined,
+     list_to_integer(HistStart)};
 parse_args(_) ->
     io:format(standard_error,
               "usage: alloc_diag.escript <node> <cookie> [--verbose]~n"
-              "                    [--trend <sec> | --watch <interval> <count>]~n",
+              "                    [--trend <sec> | --watch <interval> <count>~n"
+              "                     | --pool-sizes [<hist_start>]]~n",
               []),
     halt(1).
 
@@ -135,10 +151,17 @@ csz(L) ->
         _ -> 0
     end.
 
-%% number of pooled carriers
+%% number of pooled carriers (mbcs_pool: 2-tuple {carriers, N})
 pcnt(L) ->
     case lists:keyfind(carriers, 1, L) of
         {carriers, N} -> N;
+        _ -> 0
+    end.
+
+%% number of home (non-pooled) carriers (mbcs/sbcs: 4-tuple {carriers,C,_,_})
+hcnt(L) ->
+    case lists:keyfind(carriers, 1, L) of
+        {carriers, C, _, _} -> C;
         _ -> 0
     end.
 
@@ -158,36 +181,37 @@ diag(Target, Type, Verbose) ->
     case rpc:call(Target, erlang, system_info, [{allocator, Type}], 30000) of
         {badrpc, Reason} ->
             io:format("  ~-14s rpc error: ~p~n", [Type, Reason]),
-            {Type, 0, 0, 0, 0};
+            {Type, 0, 0, 0, 0, 0};
         false ->
             io:format("  ~-14s disabled~n", [Type]),
-            {Type, 0, 0, 0, 0};
+            {Type, 0, 0, 0, 0, 0};
         All when is_list(All) ->
-            {Home, Pools} =
-                lists:foldl(fun({instance, Ix, Props}, {H, Ps}) ->
+            {Home, HC, Pools} =
+                lists:foldl(fun({instance, Ix, Props}, {H, Hc, Ps}) ->
                                     Mb = proplists:get_value(mbcs, Props, []),
                                     Sb = proplists:get_value(sbcs, Props, []),
                                     H0 = csz(Mb) + csz(Sb),
+                                    Hc0 = hcnt(Mb) + hcnt(Sb),
                                     case proplists:get_value(mbcs_pool, Props) of
                                         undefined ->
                                             maybe_instance(Verbose, Ix, H0),
-                                            {H + H0, Ps};
+                                            {H + H0, Hc + Hc0, Ps};
                                         Pl ->
                                             N0 = pcnt(Pl),
                                             S0 = csz(Pl),
                                             U0 = blksz(proplists:get_value(blocks, Pl, [])),
                                             maybe_instance(Verbose, Ix, H0, N0, S0, U0),
-                                            {H + H0, [{N0, S0, U0} | Ps]}
+                                            {H + H0, Hc + Hc0, [{N0, S0, U0} | Ps]}
                                     end
-                            end, {0, []}, All),
+                            end, {0, 0, []}, All),
             {N, S, U} = lists:foldl(fun({A, B, C}, {Nn, Ss, Uu}) ->
                                             {Nn + A, Ss + B, Uu + C}
                                     end, {0, 0, 0}, Pools),
-            io:format("  ~-14s home=~8.2fMB  pool_carriers=~5w  "
+            io:format("  ~-14s home=~8.2fMB  home_cr=~4w  pool_cr=~4w  "
                       "pool=~8.2fMB  pool_used=~8.2fMB  "
                       "marked_reclaimable=~8.2fMB~n",
-                      [Type, mb(Home), N, mb(S), mb(U), mb(S - U)]),
-            {Type, Home, N, S, U}
+                      [Type, mb(Home), HC, N, mb(S), mb(U), mb(S - U)]),
+            {Type, Home, HC, N, S, U}
     end.
 
 maybe_instance(false, _Ix, _H0) -> ok;
@@ -269,6 +293,52 @@ verdict(F, Sk, Fp, Fa) ->
         true -> "mixed reuse"
     end.
 
+%% ---------------------------------------------------------------------
+%% Allocator configuration (strategy, abandon thresholds, carrier sizes).
+%% Note: instance 0 is the pool-disabled main instance (acul=0), so read
+%% options from a non-main instance to get the effective values.
+%% ---------------------------------------------------------------------
+print_alloc_config(Target, Types) ->
+    io:format("~n=== allocator configuration ===~n"),
+    io:format("  type           as         acul acnl acfml sbct    "
+              "smbcs   lmbcs   atags cp~n"),
+    io:format("  ------------------------------------------------------"
+              "--------------------------------~n"),
+    lists:foreach(fun(T) -> config_one(Target, T) end, Types),
+    io:format("~n"
+              "  as    allocation strategy (aoffcbf = address-ordered first fit~n"
+              "        carriers + best-fit blocks)~n"
+              "  acul  abandon carrier utilization limit (%)~n"
+              "  acnl  max carriers retained in the pool~n"
+              "  acfml min free-block size for a carrier to be abandoned~n"
+              "  sbct  single-block-carrier threshold (blocks >= this go to SBC)~n"
+              "  smbcs/lmbcs  smallest / largest multiblock carrier size~n"
+              "  cp    carrier pool enabled for this allocator (dash = off)~n"
+              "  min_block_size is strategy-internal, NOT exposed (aoff approx 48-56 B)~n").
+
+config_one(Target, Type) ->
+    case rpc:call(Target, erlang, system_info, [{allocator, Type}], 30000) of
+        All when is_list(All) ->
+            Props = case [P || {instance, Ix, P} <- All, Ix > 0] of
+                        [P1 | _] -> P1;
+                        [] -> case All of [{instance, _, P0} | _] -> P0; [] -> [] end
+                    end,
+            Opts = proplists:get_value(options, Props, []),
+            G = fun(K, D) -> proplists:get_value(K, Opts, D) end,
+            io:format("  ~-14s ~-9s ~-4w ~-4w ~-5w ~-7s ~-7s ~-7s ~-5s ~s~n",
+                      [Type, sval(G(as, undefined)), G(acul, 0), G(acnl, 0),
+                       G(acfml, 0), fmt_bytes(G(sbct, 0)), fmt_bytes(G(smbcs, 0)),
+                       fmt_bytes(G(lmbcs, 0)), sval(G(atags, false)),
+                       sval(G(cp, undefined))]);
+        _ -> ok
+    end.
+
+%% string form for config atoms/booleans (undefined -> "-")
+sval(undefined) -> "-";
+sval(A) when is_atom(A) -> atom_to_list(A);
+sval(X) when is_integer(X) -> integer_to_list(X);
+sval(X) -> lists:flatten(io_lib:format("~w", [X])).
+
 %% Two-sample diff: is the mismatch happening NOW (ongoing), or just a
 %% historical one-time pileup?
 pool_trend(Target, Types, Sec) ->
@@ -349,6 +419,77 @@ watch_type(T, Snaps, Count) ->
                verdict(DFe, DSk, DFp, DFa)]).
 
 %% ---------------------------------------------------------------------
+%% Abandoned-pool free-block size histogram (via instrument:carriers/1).
+%% Tells you WHAT SIZE the pooled free blocks are, and whether they are
+%% all the same size (one histogram slot dominating) or spread out.
+%% log2-bucketed, hist_start=512 B by default (14 slots, ~doubling).
+%% ---------------------------------------------------------------------
+pool_sizes(Target, Types, HistStart) ->
+    io:format("~n=== abandoned-pool free-block size distribution "
+              "(hist_start=~w B) ===~n", [HistStart]),
+    case rpc:call(Target, instrument, carriers,
+                  [#{histogram_start => HistStart}], 60000) of
+        {ok, {_, Carriers}} ->
+            print_pool_hist(HistStart, Carriers, Types);
+        {error, Reason} ->
+            io:format("  instrument:carriers/1 failed: ~p~n", [Reason]);
+        {badrpc, Reason} ->
+            io:format("  instrument:carriers/1 unavailable on target: ~p~n", [Reason]),
+            io:format("  (needs the 'tools' OTP app in the release; otherwise run~n"
+                      "   the erts_internal:gather_carrier_info/1 snippet manually~n"
+                      "   in a remsh shell)~n");
+        Other ->
+            io:format("  unexpected result: ~p~n", [Other])
+    end.
+
+print_pool_hist(HistStart, Carriers, Types) ->
+    %% aggregate the free-block histogram of InPool carriers, per allocator
+    Agg = lists:foldl(
+            fun({A, true, _Sz, _Unsc, _Blk, FH}, Acc) ->
+                    Zero = erlang:make_tuple(tuple_size(FH), 0),
+                    Old  = maps:get(A, Acc, Zero),
+                    Sum  = list_to_tuple([element(I, Old) + element(I, FH)
+                                          || I <- lists:seq(1, tuple_size(FH))]),
+                    maps:put(A, Sum, Acc);
+               (_, Acc) -> Acc
+            end, #{}, Carriers),
+    case lists:any(fun(A) -> maps:is_key(A, Agg) end, Types) of
+        false ->
+            io:format("  (no carriers are currently in the pool)~n");
+        true ->
+            io:format("  (log2-bucketed, hist_start=~w B; each slot doubles in size)~n",
+                      [HistStart]),
+            lists:foreach(
+              fun(A) ->
+                      case maps:get(A, Agg, undefined) of
+                          undefined -> ok;
+                          Sum ->
+                              Total = lists:sum(tuple_to_list(Sum)),
+                              io:format("~n  ~-14s ~w free block~s in pool:~n",
+                                        [A, Total, plural(Total)]),
+                              lists:foreach(
+                                fun(I) ->
+                                        N = element(I, Sum),
+                                        if N > 0 ->
+                                               io:format("    ~10s  ~w block~s~n",
+                                                         [fmt_bytes(HistStart bsl (I - 1)),
+                                                          N, plural(N)]);
+                                           true -> ok
+                                        end
+                                end, lists:seq(1, tuple_size(Sum)))
+                      end
+              end, Types)
+    end.
+
+plural(1) -> "";
+plural(_) -> "s".
+
+fmt_bytes(B) when B >= 1073741824 -> integer_to_list(B div 1073741824) ++ " GB";
+fmt_bytes(B) when B >= 1048576    -> integer_to_list(B div 1048576) ++ " MB";
+fmt_bytes(B) when B >= 1024       -> integer_to_list(B div 1024) ++ " KB";
+fmt_bytes(B)                      -> integer_to_list(B) ++ " B".
+
+%% ---------------------------------------------------------------------
 %% OS RSS / cgroup on the target (robust across Linux/BusyBox/macOS)
 %% ---------------------------------------------------------------------
 target_pid(Node) ->
@@ -398,16 +539,18 @@ cgroup_limit(Node) ->
 %% Overall summary
 %% ---------------------------------------------------------------------
 summarize(Target, Rs, OtpMajor) ->
-    {H, N, S, U} =
-        lists:foldl(fun({_, H0, N0, S0, U0}, {H1, N1, S1, U1}) ->
-                            {H1 + H0, N1 + N0, S1 + S0, U1 + U0}
-                    end, {0, 0, 0, 0}, Rs),
+    {H, HC, N, S, U} =
+        lists:foldl(fun({_, H0, HC0, N0, S0, U0}, {H1, HC1, N1, S1, U1}) ->
+                            {H1 + H0, HC1 + HC0, N1 + N0, S1 + S0, U1 + U0}
+                    end, {0, 0, 0, 0, 0}, Rs),
     Mem = rpc:call(Target, erlang, memory, [], 15000),
     Live = proplists:get_value(binary, Mem, 0),
     Total = proplists:get_value(total, Mem, 0),
     Rss = target_rss(Target),
     Cg = cgroup_limit(Target),
     io:format("~n=== overall ===~n"),
+    io:format("  total carriers:              ~w  (home=~w, pool=~w)~n",
+              [HC + N, HC, N]),
     io:format("  VM retained (home+pool):     ~8.2fMB~n", [mb(H + S)]),
     io:format("    home (not marked):         ~8.2fMB~n", [mb(H)]),
     io:format("    pool total (abandoned):    ~8.2fMB   (~w carriers)~n",
