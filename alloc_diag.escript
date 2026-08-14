@@ -102,8 +102,8 @@ client_name(Target) ->
     list_to_atom("remsh_allocdiag_" ++ os:getpid() ++ "@" ++ Host).
 
 print_header(Target, OtpMajor) ->
-    Emqx = case rpc:call(Target, application, get_key, [emqx, vsn], 10000) of
-               {ok, V} -> V;
+    Emqx = case rpc:call(Target, emqx_sys, version, [], 10000) of
+               V when is_list(V); is_binary(V) -> V;
                _ -> "?"
            end,
     io:format("~nemqx ~s (OTP ~p) node ~p~n~n",
