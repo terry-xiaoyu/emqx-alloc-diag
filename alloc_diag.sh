@@ -48,6 +48,12 @@ Options:
   --node <name>  target node name (overrides auto-detection).
   --cookie <c>   target node cookie (overrides auto-detection).
   --verbose      print per-instance breakdown.
+  --trend <sec>  sample the carrier-pool reuse counters twice, <sec> apart,
+                 and print the delta (quick ONGOING-size-mismatch check).
+  --watch <interval> <count>  sample the counters <count> times, <interval>
+                 apart; reports total deltas, how many intervals were active,
+                 and the net RSS change. Use this when RSS fluctuates rather
+                 than rising monotonically.
   -h, --help     show this help.
 
 Node name / cookie are auto-detected in this order:
@@ -71,6 +77,7 @@ CONF="${EMQX_CONF:-}"
 NODE="${EMQX_NODE:-}"
 COOKIE="${EMQX_COOKIE:-}"
 VERBOSE=""
+TREND=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --rel)    REL="$2"; shift 2 ;;
@@ -78,6 +85,8 @@ while [ $# -gt 0 ]; do
         --node)   NODE="$2"; shift 2 ;;
         --cookie) COOKIE="$2"; shift 2 ;;
         --verbose) VERBOSE="--verbose"; shift ;;
+        --trend) TREND="--trend $2"; shift 2 ;;
+        --watch) TREND="--watch $2 $3"; shift 3 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown arg: $1 (try -h)" >&2; exit 1 ;;
     esac
@@ -146,4 +155,4 @@ echo "using node:    $NODE"
 export ERL_FLAGS="-start_epmd false -epmd_module ekka_epmd -boot_var RELEASE_LIB \"$REL/lib\""
 
 exec "$ERTS_DIR/bin/escript" "$SCRIPT_DIR/alloc_diag.escript" \
-    "$NODE" "$COOKIE" $VERBOSE
+    "$NODE" "$COOKIE" $VERBOSE $TREND

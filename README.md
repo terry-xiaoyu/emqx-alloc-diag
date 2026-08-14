@@ -20,6 +20,7 @@ It separately accounts for the memory that has been abandoned into the carrier p
 - [5. vm.args recommendations by OTP version](#5-vmargs-recommendations-by-otp-version)
 - [6. How EMQX node connection works](#6-how-emqx-node-connection-works)
 - [7. Docker usage](#7-docker-usage)
+- [8. Size-mismatch diagnosis (RSS keeps rising)](#8-size-mismatch-diagnosis-rss-keeps-rising)
 
 ---
 
@@ -37,6 +38,12 @@ It separately accounts for the memory that has been abandoned into the carrier p
 
 # Show per-instance details
 ./alloc_diag.sh --rel /path/to/emqx-release --verbose
+
+# Confirm an ONGOING size mismatch (see Section 8):
+#   --trend 60     quick two-sample check
+#   --watch 60 10  for fluctuating RSS: 10 samples, 60s apart, count active intervals
+./alloc_diag.sh --rel /path/to/emqx-release --trend 60
+./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
 ```
 
 **You must run it with EMQX's own release `erts`** (the wrapper already handles this), as explained in [Section 6](#6-how-emqx-node-connection-works).
@@ -274,10 +281,82 @@ Tested images:
 
 ---
 
+## 8. Size-mismatch diagnosis (RSS keeps rising)
+
+A large pool (abandoned carriers) does not always mean it is being reused. If
+the new allocation size no longer matches the free blocks left in the pool, the
+pool cannot serve them, and the allocator `mmap`s a brand-new carrier every
+time — RSS keeps rising even though the pool is huge.
+
+The tool reads the carrier-pool reuse counters (`erlang:system_info` →
+`mbcs_pool`) and prints them per allocator:
+
+```
+=== carrier-pool reuse / size-mismatch diagnosis ===
+  type           fetch        skip_size    fail_pooled  fail         verdict
+  -----------------------------------------------------------------------------------------
+  binary_alloc   120          98000        1200         2100         SIZE MISMATCH (blocks too small)
+  eheap_alloc    540000       15           2            30           pool reused (not size mismatch)
+  ...
+```
+
+| Counter | Meaning |
+|---|---|
+| `fetch` | a pooled carrier **was** reused (good) |
+| `skip_size` | pooled carrier found, but its **largest free block was smaller than the request** — the size-mismatch smoking gun |
+| `fail_pooled` | gave up searching the instance's own pool (no carrier fit) |
+| `fail` | total pool-allocation failures → a **new carrier is `mmap`'d → RSS grows** |
+
+> Counters are stored as `{Key, Giga, Low}` where `Giga = count div 10^9` and
+> `Low = count rem 10^9` (see `ERTS_ALC_CC_GIGA_VAL` / `ONE_GIGA` in
+> `erl_alloc_util.c`). The tool combines them as `Giga * 10^9 + Low` — note it
+> is **10^9, not 2^30**.
+
+**How to read**:
+
+- `skip_size` / `fail_pooled` >> `fetch` → **size mismatch**: the pool's free
+  blocks are mostly too small for new demand. RSS grows because the allocator
+  keeps creating new carriers.
+- `fetch` dominates → the pool is reused normally; RSS growth is live-set
+  growth instead.
+- all zero → no pool activity (pool empty, or carrier migration off — check the
+  home/pool table and the `acul` note in the recommendations).
+
+**Confirm it is ONGOING (not a historical one-time pileup)**:
+
+```bash
+# quick two-sample check (fine when RSS is steady)
+./alloc_diag.sh --rel /path/to/emqx-release --trend 60
+
+# fluctuating RSS: sample 10 times, 60s apart, and count active intervals
+./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
+```
+
+`--trend` samples twice and prints the deltas. `--watch` samples `count` times,
+`interval` seconds apart, and additionally reports the net RSS change and how
+many intervals (`active`) saw a mismatch.
+
+Because the counters are cumulative/monotonic, a single short diff can land in a
+quiet trough and under-report an ongoing mismatch when RSS fluctuates (rises on
+average but not monotonically). `--watch` spans several fluctuation cycles and
+is the right tool in that case.
+
+- `d(skip_size)` / `d(fail)` keep growing while `d(fetch)` stays ~0, and
+  `active` is high → the mismatch is ongoing and drives RSS up.
+- all deltas ~0 → the pool is just a historical pileup.
+
+The root cause is usually a **shift in the allocation-size distribution**: after
+a burst of small objects abandoned carriers full of small free blocks, a burst
+of larger objects cannot fit them, so each burst `mmap`s new carriers. Collect
+the numbers above first, then decide the fix (tune `acul`/`acfml`, or accept the
+size shift as an expected workload change).
+
+---
+
 ## File list
 
 | File | Purpose |
 |---|---|
 | `alloc_diag.sh` | Wrapper: locate release/erts, detect node name and cookie, set `ERL_FLAGS` |
-| `alloc_diag.escript` | Main logic: RPC collection, parsing, aggregation, RSS/cgroup, OTP detection, and recommendations |
+| `alloc_diag.escript` | Main logic: RPC collection, parsing, aggregation, RSS/cgroup, OTP detection, carrier-pool reuse / size-mismatch diagnosis (`--trend`), and recommendations |
 | `README.md` | This document |

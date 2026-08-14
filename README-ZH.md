@@ -18,6 +18,7 @@
 - [五、按 OTP 版本给出的 vm.args 建议](#五按-otp-版本给出的-vmargs-建议)
 - [六、如何连接 EMQX 节点（原理）](#六如何连接-emqx-节点原理)
 - [七、Docker 使用](#七docker-使用)
+- [八、尺寸不匹配诊断（RSS 持续上涨）](#八尺寸不匹配诊断rss-持续上涨)
 
 ---
 
@@ -35,6 +36,12 @@
 
 # 显示每个 instance 的明细
 ./alloc_diag.sh --rel /path/to/emqx-release --verbose
+
+# 确认「正在发生」的尺寸不匹配（见第八节）：
+#   --trend 60     快速两采样检查
+#   --watch 60 10  RSS 波动场景：采样 10 次（间隔 60s），统计活跃区间数
+./alloc_diag.sh --rel /path/to/emqx-release --trend 60
+./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
 ```
 
 **必须使用 EMQX 自己 release 中的 `erts` 来运行**（wrapper 已经帮你处理好了），原因请见[第六节](#六如何连接-emqx-节点原理)。
@@ -272,10 +279,61 @@ docker exec emqx bash /tmp/alloc_diag.sh --rel /opt/emqx
 
 ---
 
+## 八、尺寸不匹配诊断（RSS 持续上涨）
+
+pool 很大（abandon 的 carrier 很多）**不代表它一定在被复用**。如果新分配的大小和 pool 里留下的空闲块对不上，pool 就服务不了它们，allocator 每次只能重新 `mmap` 一块新 carrier —— 于是哪怕 pool 有 8GB，RSS 仍然一直往上涨。
+
+工具会读取 carrier-pool 的复用计数器（`erlang:system_info` → `mbcs_pool`），按 allocator 打印出来：
+
+```
+=== carrier-pool reuse / size-mismatch diagnosis ===
+  type           fetch        skip_size    fail_pooled  fail         verdict
+  -----------------------------------------------------------------------------------------
+  binary_alloc   120          98000        1200         2100         SIZE MISMATCH (blocks too small)
+  eheap_alloc    540000       15           2            30           pool reused (not size mismatch)
+  ...
+```
+
+| 计数器 | 含义 |
+|---|---|
+| `fetch` | 成功从 pool 复用一个 carrier 的次数（好事） |
+| `skip_size` | 找到了 pool 里的 carrier，但它的**最大空闲块比请求还小** —— 尺寸不匹配的直接证据 |
+| `fail_pooled` | 搜完本 instance 自己的 pool 也没找到合适的 carrier |
+| `fail` | pool 获取的总失败次数 → 只能**新建 carrier → RSS 上涨** |
+
+> 计数器在底层存储为 `{Key, Giga, Low}`，其中 `Giga = count div 10^9`、`Low = count rem 10^9`（见 `erl_alloc_util.c` 里的 `ERTS_ALC_CC_GIGA_VAL` / `ONE_GIGA`）。工具按 `Giga * 10^9 + Low` 合并 —— 注意是 **10⁹，不是 2³⁰**。
+
+**怎么读**：
+
+- `skip_size` / `fail_pooled` 远大于 `fetch` → **尺寸不匹配**：pool 里的空闲块普遍比新需求小，allocator 不停建新 carrier，RSS 随之上涨。
+- `fetch` 占主导 → pool 在正常复用，RSS 上涨是**活工作集增长**，不是不匹配。
+- 全为 0 → 没有 pool 活动（pool 为空，或 carrier migration 没开 —— 看 home/pool 表和建议里的 `acul` 提示）。
+
+**确认它是「正在发生」而非历史一次性堆积**：
+
+```bash
+# 快速两采样检查（RSS 平稳时够用）
+./alloc_diag.sh --rel /path/to/emqx-release --trend 60
+
+# RSS 波动场景：采样 10 次（间隔 60s），统计活跃区间数
+./alloc_diag.sh --rel /path/to/emqx-release --watch 60 10
+```
+
+`--trend` 采样两次并打印差值；`--watch` 采样 `count` 次（间隔 `interval` 秒），额外输出 RSS 净变化、以及有多少个区间（`active`）出现了不匹配。
+
+因为计数器是累计/单调的，**单次短差值可能正好落在波谷、低估正在发生的不匹配**（RSS 平均上行但并非单调）。`--watch` 跨越多个波动周期，是这种情况下该用的工具。
+
+- `d(skip_size)`、`d(fail)` 持续增长、`d(fetch)` 接近 0，且 `active` 很高 → 不匹配正在发生、正是它推高 RSS。
+- 各差值都约为 0 → pool 只是历史堆积。
+
+根因通常是**分配尺寸分布发生了偏移**：一波小对象把 carrier abandon 成满是小空闲块的 pool，接着一波大对象塞不进这些小块，于是每一波都重新 `mmap` 新 carrier。先拿到上面的数据，再决定怎么调（`acul`/`acfml`，或确认这个尺寸偏移是否属于预期的负载变化）。
+
+---
+
 ## 文件清单
 
 | 文件 | 作用 |
 |---|---|
 | `alloc_diag.sh` | wrapper：定位 release/erts、探测节点名与 cookie，并设置 `ERL_FLAGS` |
-| `alloc_diag.escript` | 主体逻辑：RPC 抓取数据、解析、汇总、RSS/cgroup、OTP 探测与建议 |
+| `alloc_diag.escript` | 主体逻辑：RPC 抓取数据、解析、汇总、RSS/cgroup、OTP 探测、carrier-pool 复用 / 尺寸不匹配诊断（`--trend`）与建议 |
 | `README.md` | 本文档 |
