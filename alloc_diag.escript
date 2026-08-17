@@ -56,7 +56,7 @@ main(Args) ->
     end,
     case PoolSizes of
         false -> ok;
-        HS -> pool_sizes(Target, Types, HS)
+        {HistStart, HistWidth} -> pool_sizes(Target, Types, HistStart, HistWidth)
     end,
     print_recommendations(State),
     halt(0).
@@ -79,22 +79,35 @@ parse_args([NodeStr, Cookie, "--verbose", "--watch", Interval, Count]) ->
     {list_to_atom(NodeStr), Cookie, true, undefined,
      {list_to_integer(Interval), list_to_integer(Count)}, false};
 parse_args([NodeStr, Cookie, "--pool-sizes"]) ->
-    {list_to_atom(NodeStr), Cookie, false, undefined, undefined, 512};
-parse_args([NodeStr, Cookie, "--pool-sizes", HistStart]) ->
+    {list_to_atom(NodeStr), Cookie, false, undefined, undefined, {512, 14}};
+parse_args([NodeStr, Cookie, "--pool-sizes", PoolSpec]) ->
     {list_to_atom(NodeStr), Cookie, false, undefined, undefined,
-     list_to_integer(HistStart)};
+     parse_pool_sizes(PoolSpec)};
 parse_args([NodeStr, Cookie, "--verbose", "--pool-sizes"]) ->
-    {list_to_atom(NodeStr), Cookie, true, undefined, undefined, 512};
-parse_args([NodeStr, Cookie, "--verbose", "--pool-sizes", HistStart]) ->
+    {list_to_atom(NodeStr), Cookie, true, undefined, undefined, {512, 14}};
+parse_args([NodeStr, Cookie, "--verbose", "--pool-sizes", PoolSpec]) ->
     {list_to_atom(NodeStr), Cookie, true, undefined, undefined,
-     list_to_integer(HistStart)};
+     parse_pool_sizes(PoolSpec)};
 parse_args(_) ->
     io:format(standard_error,
               "usage: alloc_diag.escript <node> <cookie> [--verbose]~n"
               "                    [--trend <sec> | --watch <interval> <count>~n"
-              "                     | --pool-sizes [<hist_start>]]~n",
+              "                     | --pool-sizes [<hist_start>[,<hist_width>]]]~n",
               []),
     halt(1).
+
+parse_pool_sizes(Spec) ->
+    case string:tokens(Spec, ",") of
+        [HistStart] ->
+            {list_to_integer(HistStart), 14};
+        [HistStart, HistWidth] ->
+            {list_to_integer(HistStart), list_to_integer(HistWidth)};
+        _ ->
+            io:format(standard_error,
+                      "invalid --pool-sizes argument (expected <hist_start>"
+                      " or <hist_start>,<hist_width>): ~s~n", [Spec]),
+            halt(1)
+    end.
 
 %% unique short-lived node name, same host as the target (longnames)
 client_name(Target) ->
@@ -422,13 +435,14 @@ watch_type(T, Snaps, Count) ->
 %% Abandoned-pool free-block size histogram (via instrument:carriers/1).
 %% Tells you WHAT SIZE the pooled free blocks are, and whether they are
 %% all the same size (one histogram slot dominating) or spread out.
-%% log2-bucketed, hist_start=512 B by default (14 slots, ~doubling).
+%% log2-bucketed, hist_start=512 B / hist_width=14 by default (~doubling).
 %% ---------------------------------------------------------------------
-pool_sizes(Target, Types, HistStart) ->
+pool_sizes(Target, Types, HistStart, HistWidth) ->
     io:format("~n=== abandoned-pool free-block size distribution "
-              "(hist_start=~w B) ===~n", [HistStart]),
+              "(hist_start=~w B, hist_width=~w) ===~n", [HistStart, HistWidth]),
     case rpc:call(Target, instrument, carriers,
-                  [#{histogram_start => HistStart}], 60000) of
+                  [#{histogram_start => HistStart,
+                     histogram_width => HistWidth}], 60000) of
         {ok, {_, Carriers}} ->
             print_pool_hist(HistStart, Carriers, Types);
         {error, Reason} ->
@@ -457,13 +471,19 @@ print_pool_hist(HistStart, Carriers, Types) ->
         false ->
             io:format("  (no carriers are currently in the pool)~n");
         true ->
-            io:format("  (log2-bucketed, hist_start=~w B; each slot doubles in size)~n",
-                      [HistStart]),
+            HistWidth = case maps:values(Agg) of
+                            [] -> 0;
+                            [S | _] -> tuple_size(S)
+                        end,
+            io:format("  (log2-bucketed, hist_start=~w B, hist_width=~w; "
+                      "each slot doubles in size; last slot is open-ended)~n",
+                      [HistStart, HistWidth]),
             lists:foreach(
               fun(A) ->
                       case maps:get(A, Agg, undefined) of
                           undefined -> ok;
                           Sum ->
+                              TupleSize = tuple_size(Sum),
                               Total = lists:sum(tuple_to_list(Sum)),
                               io:format("~n  ~-14s ~w free block~s in pool:~n",
                                         [A, Total, plural(Total)]),
@@ -472,14 +492,24 @@ print_pool_hist(HistStart, Carriers, Types) ->
                                         N = element(I, Sum),
                                         if N > 0 ->
                                                io:format("    ~10s  ~w block~s~n",
-                                                         [fmt_bytes(HistStart bsl (I - 1)),
+                                                         [hist_label(HistStart, I, TupleSize),
                                                           N, plural(N)]);
                                            true -> ok
                                         end
-                                end, lists:seq(1, tuple_size(Sum)))
+                                end, lists:seq(1, TupleSize))
                       end
               end, Types)
     end.
+
+%% Print the bucket label.  Non-last slots are shown by their upper bound;
+%% the last slot is the open-ended overflow bucket, so "128 B" would be
+%% misleading there (it actually means ">= 64 B" when hist_width=3).
+hist_label(_HistStart, _I, TupleSize) when TupleSize =< 2 ->
+    "all";
+hist_label(HistStart, I, TupleSize) when I =:= TupleSize ->
+    ">= " ++ fmt_bytes(HistStart bsl (TupleSize - 2));
+hist_label(HistStart, I, _TupleSize) ->
+    fmt_bytes(HistStart bsl (I - 1)).
 
 plural(1) -> "";
 plural(_) -> "s".

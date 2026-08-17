@@ -343,20 +343,26 @@ pool 很大（abandon 的 carrier 很多）**不代表它一定在被复用**。
 
 # 细粒度 hist_start=32 B —— 用来区分 ~76B/104B 与 256B 的块
 ./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32
+
+# 也可以指定 histogram_width（分桶数）；默认 14，最后一个桶是开放式溢出桶
+# 下面的 width=3 会把所有 >=64 B 的块都合并到最后一档
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32,3
 ```
 
 它在节点上调用 `instrument:carriers/1`，把每个 pooled carrier 的空闲块尺寸直方图按 allocator 聚合：
 
 ```
-=== abandoned-pool free-block size distribution (hist_start=512 B) ===
-  (log2-bucketed, hist_start=512 B; each slot doubles in size)
+=== abandoned-pool free-block size distribution (hist_start=512 B, hist_width=14) ===
+  (log2-bucketed, hist_start=512 B, hist_width=14; each slot doubles in size; last slot is open-ended)
 
   binary_alloc   6 free blocks in pool:
          64 KB  5 blocks
-          4 MB  1 block
+        >= 2 MB  1 block
 ```
 
-怎么读：池里空闲块大多是 ~64 KB、少量 ~4 MB —— 即**不是单一尺寸**。如果只有一个槽占绝对多数（比如全是 ~8 KB），说明 churn 的是某类固定大小的对象；如果铺满多个槽，则是多种尺寸混在一起。
+怎么读：池里空闲块大多是 ~64 KB、少量至少 2 MB —— 即**不是单一尺寸**。如果只有一个槽占绝对多数（比如全是 ~8 KB），说明 churn 的是某类固定大小的对象；如果铺满多个槽，则是多种尺寸混在一起。
+
+注意最后一个桶是开放式溢出桶，脚本会用 `>=` 标记；例如 `--pool-sizes 32,3` 输出里的 `>= 64 B` 表示“所有 >=64 B 的块都挤在这一档”，并不是“64 到 128 B 之间”。
 
 更小的 `hist_start` 能给出更细的分桶：76 字节的 message payload 会变成一个 ~104 字节的块（payload + header + atag），默认 512 B 直方图会把它们全塞进 "<512 B" 这一档，而 `--pool-sizes 32` 能把它们解析到 "~128 B" 档。用它来确认某类固定尺寸的小消息 churn 正在填满池子。
 

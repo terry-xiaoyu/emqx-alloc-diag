@@ -54,11 +54,16 @@ Options:
                  apart; reports total deltas, how many intervals were active,
                  and the net RSS change. Use this when RSS fluctuates rather
                  than rising monotonically.
-  --pool-sizes [<hist_start>]   print the size distribution (log2 histogram)
-                 of free blocks in the abandoned carrier pool, so you can see
-                 what sizes are churning in and whether they are all the same.
+  --pool-sizes [<hist_start>[,<hist_width>]]
+                 print the size distribution (log2 histogram) of free blocks
+                 in the abandoned carrier pool, so you can see what sizes are
+                 churning in and whether they are all the same.
                  Optional <hist_start> (default 512 B) gives finer buckets for
                  small blocks (e.g. 32 to resolve ~76B message blocks).
+                 Optional <hist_width> (default 14) controls the number of
+                 buckets; the last bucket is open-ended, so a too-small width
+                 lumps all larger sizes together. Use comma to pass both, e.g.
+                 --pool-sizes 32,3.
   -h, --help     show this help.
 
 Node name / cookie are auto-detected in this order:
@@ -96,8 +101,8 @@ while [ $# -gt 0 ]; do
         --pool-sizes)
             POOLSIZES="--pool-sizes"
             shift
-            # optional numeric histogram_start (finer buckets for small blocks)
-            if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+            # optional numeric histogram_start, optionally with ,<hist_width>
+            if [ $# -gt 0 ] && [[ "$1" =~ ^[0-9]+(,[0-9]+)?$ ]]; then
                 POOLSIZES="$POOLSIZES $1"; shift
             fi
             ;;

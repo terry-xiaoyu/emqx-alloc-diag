@@ -371,23 +371,32 @@ whether they are all the same size or not):
 
 # fine granularity: hist_start=32 B — to distinguish ~76B/104B from 256B blocks
 ./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32
+
+# histogram_width is also configurable (default 14); the last bucket is an
+# open-ended overflow bucket, so width=3 merges every block >=64 B into the last row
+./alloc_diag.sh --rel /path/to/emqx-release --pool-sizes 32,3
 ```
 
 This calls `instrument:carriers/1` on the node and aggregates the free-block
 size histogram of every pooled carrier, per allocator:
 
 ```
-=== abandoned-pool free-block size distribution (hist_start=512 B) ===
-  (log2-bucketed, hist_start=512 B; each slot doubles in size)
+=== abandoned-pool free-block size distribution (hist_start=512 B, hist_width=14) ===
+  (log2-bucketed, hist_start=512 B, hist_width=14; each slot doubles in size; last slot is open-ended)
 
   binary_alloc   6 free blocks in pool:
          64 KB  5 blocks
-          4 MB  1 block
+        >= 2 MB  1 block
 ```
 
-Reading: the pool's free blocks are mostly ~64 KB plus a few ~4 MB — i.e. **not
-one uniform size**. If a single slot dominates (e.g. all ~8 KB), the churn is one
-fixed-size object; if it spreads across many slots, many sizes mix together.
+Reading: the pool's free blocks are mostly ~64 KB plus a few blocks of at least
+2 MB — i.e. **not one uniform size**. If a single slot dominates (e.g. all
+~8 KB), the churn is one fixed-size object; if it spreads across many slots,
+many sizes mix together.
+
+Note the last bucket is open-ended and is printed with `>=`; for example
+`--pool-sizes 32,3` prints `>= 64 B` for all blocks 64 B and larger, not just
+the 64–128 B range.
 
 A smaller `hist_start` gives finer buckets for small blocks: a 76-byte message
 payload becomes a ~104-byte block (payload + header + atag), which the default
